@@ -2,114 +2,159 @@ import os
 import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from math import radians, sin, cos, sqrt, atan2
+import pandas as pd
+import joblib
 
-# Add this line after initializing your Flask app
-
-# Initialize Flask app
 app = Flask(__name__)
-CORS(app)
+CORS(app, origins="http://localhost:3000")
+
+# Base URLs for APIs
+NASA_POWER_API_URL = "https://power.larc.nasa.gov/api/temporal/daily/point"
+NIWE_API_URL = "https://niwe.res.in"
+IMD_API_URL = "https://mausam.imd.gov.in"
+BHUWAN_API_URL = "https://bhuvan.nrsc.gov.in/api"
+PROTECTED_PLANET_API_URL = "https://www.protectedplanet.net"
+COPERNICUS_API_URL = "https://land.copernicus.eu"
+CEA_API_URL = "https://cea.nic.in/api/instcap_allindia_res.php"
+VIIRS_API_URL = "https://earthdata.nasa.gov"
 
 
-# Environment variables for API keys (Set these in your system or use a .env file)
-NASA_POWER_API_URL = "https://power.larc.nasa.gov/api/"
-NIWE_API_URL = "https://niwe.res.in/"
-IMD_API_URL = "https://mausam.imd.gov.in/"
-BHUWAN_API_URL = "https://bhuvan.nrsc.gov.in/"
-# OSM_API_URL = "https://www.openstreetmap.org/"
-PROTECTED_PLANET_API_URL = "https://www.protectedplanet.net/"
-COPERNICUS_API_URL = "https://land.copernicus.eu/"
-CEA_API_URL = "https://cea.nic.in/"
-VIIRS_API_URL = "https://earthdata.nasa.gov/"
-# MAPMYINDIA_API_URL = "https://www.mapmyindia.com/api/"
-BHUWAN_WEB_API_URL = "https://bhuvan.nrsc.gov.in/bhuvanweb/"
+MODEL_PATH = "models/solar_suitability_model.pkl"
+model = joblib.load(MODEL_PATH)
 
+@app.route('/predict', methods=['POST'])
+def predict():
+    # Expect JSON input with required features
+    data = request.get_json()
+    features = ['Latitude', 'Longitude', 'Annual', 'Summer_Avg', 'Winter_Avg']
+    
+    try:
+        input_data = pd.DataFrame([data], columns=features)
+        prediction = model.predict(input_data)
+        return jsonify({'prediction': prediction.tolist()})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 400
+    
+# Utility function for API requests
+def fetch_api_data(url, params=None):
+    try:
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+        return response.json()
+    except requests.RequestException as e:
+        return {"error": str(e)}
 
+# Utility function to calculate the distance between two points (Haversine formula)
+def calculate_distance(lat1, lon1, lat2, lon2):
+    R = 6371  # Earth's radius in kilometers
+    dlat = radians(lat2 - lat1)
+    dlon = radians(lon2 - lon1)
+    a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
+    c = 2 * atan2(sqrt(a), sqrt(1 - a))
+    return R * c
+
+# API routes
 @app.route('/climate-data', methods=['GET'])
 def get_climate_data():
-    """Fetch solar radiation, wind speed, and temperature data from NASA POWER API"""
-    location = request.args.get('location', '28.6139,77.2090')  # Default to New Delhi coordinates
+    location = request.args.get('location', '28.6139,77.2090')  # Default: New Delhi
+    lat, lon = location.split(',')
     params = {
-        'latitude': location.split(',')[0],
-        'longitude': location.split(',')[1],
-        'parameters': 'ALLSKY_SFC_SW_DWN,T2M,WS10M',  # Example parameters for solar, temp, wind
-        'format': 'json'
+        "latitude": lat,
+        "longitude": lon,
+        "parameters": "ALLSKY_SFC_SW_DWN,T2M,WS10M",
+        "community": "re",
+        "start": "20250101",
+        "end": "20250102",
+        "format": "json",
     }
-    response = requests.get(NASA_POWER_API_URL + 'temporal/daily/point', params=params)
-    return response.json()
+    data = fetch_api_data(NASA_POWER_API_URL, params)
+    return jsonify(data)
+
+def fetch_geocode(address):
+    api_key = "6f8c07f5860c4cc58db6e1b1bc5e7ca5"
+    url = f"https://api.opencagedata.com/geocode/v1/json?q={address}&key={api_key}"
+    return fetch_api_data(url)
+
+@app.route('/geocode', methods=['GET'])
+def geocode():
+    address = request.args.get('address')
+    if not address:
+        return jsonify({"error": "Address is required"}), 400
+
+    geocode_data = fetch_geocode(address)
+    if "error" in geocode_data:
+        return jsonify({"error": geocode_data["error"]}), 500
+
+    if geocode_data["results"]:
+        return jsonify(geocode_data["results"][0]["geometry"])
+    else:
+        return jsonify({"error": "City not found"}), 404
 
 
-@app.route('/wind-resource', methods=['GET'])
-def get_wind_resource_data():
-    """Fetch wind speed data from NIWE API"""
-    location = request.args.get('location', '28.6139,77.2090')  # Default to New Delhi coordinates
-    response = requests.get(f"{NIWE_API_URL}/api/wind/{location}")
-    return response.json()
+
+@app.route('/distance-matrix', methods=['POST'])
+def get_distance_matrix():
+    """Generate a distance matrix for a list of locations."""
+    locations = request.json.get('locations', [])
+    if not locations or len(locations) < 2:
+        return jsonify({"error": "At least two locations are required."}), 400
+
+    matrix = []
+    for loc1 in locations:
+        row = []
+        for loc2 in locations:
+            dist = calculate_distance(loc1['lat'], loc1['lng'], loc2['lat'], loc2['lng'])
+            row.append(dist)
+        matrix.append(row)
+
+    return jsonify({"matrix": matrix})
+
+@app.route('/bhuvan-map', methods=['GET', 'POST'])
+def generate_bhuvan_map_data():
+    """Fetch or generate spatial mapping data."""
+    if request.method == 'POST':
+        user_data = request.json.get('user_data', [])
+        if user_data:
+            return jsonify(user_data)
+
+    # Default mock data for GET requests
+    mock_data = [
+        {"lat": 28.6139, "lng": 77.2090, "name": "New Delhi"},
+        {"lat": 28.7041, "lng": 77.1025, "name": "Delhi"},
+        {"lat": 27.1767, "lng": 78.0081, "name": "Agra"},
+    ]
+    return jsonify(mock_data)
 
 
-@app.route('/weather', methods=['GET'])
-def get_weather_data():
-    """Fetch weather data (rainfall, temperature) from IMD API"""
-    location = request.args.get('location', 'Delhi')  # Default to Delhi city
-    response = requests.get(f"{IMD_API_URL}/api/weather/{location}")
-    return response.json()
+@app.route('/all-data', methods=['GET'])
+def get_all_data():
+    location = request.args.get('location', '28.6139,77.2090')  # Default: New Delhi
+    lat, lon = location.split(',')
 
+    # Fetch data from multiple APIs concurrently
+    climate_data = fetch_api_data(
+        NASA_POWER_API_URL,
+        {
+            "latitude": lat,
+            "longitude": lon,
+            "parameters": "ALLSKY_SFC_SW_DWN,T2M,WS10M",
+            "community": "re",
+            "start": "20250101",
+            "end": "20250102",
+            "format": "json",
+        },
+    )
+    wind_data = fetch_api_data(f"{NIWE_API_URL}/api/wind?latitude={lat}&longitude={lon}")
+    protected_areas = fetch_api_data(f"{PROTECTED_PLANET_API_URL}/api/protected-areas")
 
-@app.route('/land-use', methods=['GET'])
-def get_land_use_data():
-    """Fetch land use data from Bhuvan API"""
-    response = requests.get(f"{BHUWAN_API_URL}/api/land-use")
-    return response.json()
-
-
-# @app.route('/infrastructure', methods=['GET'])
-# def get_infrastructure_data():
-#     """Fetch road, transmission line data from OpenStreetMap API"""
-#     response = requests.get(f"{OSM_API_URL}/api/infrastructure")
-#     return response.json()
-
-
-@app.route('/protected-areas', methods=['GET'])
-def get_protected_areas():
-    """Fetch protected areas data from Protected Planet API"""
-    response = requests.get(f"{PROTECTED_PLANET_API_URL}/api/protected-areas")
-    return response.json()
-
-
-@app.route('/environmental-sensitivity', methods=['GET'])
-def get_environmental_sensitivity_data():
-    """Fetch environmental sensitivity data from Copernicus API"""
-    response = requests.get(f"{COPERNICUS_API_URL}/api/environmental-sensitivity")
-    return response.json()
-
-
-@app.route('/energy-demand', methods=['GET'])
-def get_energy_demand_data():
-    """Fetch energy demand data from CEA API"""
-    response = requests.get(f"{CEA_API_URL}/api/energy-demand")
-    return response.json()
-
-
-@app.route('/nighttime-lights', methods=['GET'])
-def get_nighttime_lights_data():
-    """Fetch nighttime lights data from NASA VIIRS API"""
-    location = request.args.get('location', '28.6139,77.2090')  # Default to New Delhi coordinates
-    response = requests.get(f"{VIIRS_API_URL}/api/viirs-nighttime-lights?location={location}")
-    return response.json()
-
-
-# @app.route('/map-visualization', methods=['GET'])
-# def get_map_visualization():
-#     """Fetch map visualization layers from MapMyIndia API"""
-#     response = requests.get(f"{MAPMYINDIA_API_URL}/api/map-visualization")
-#     return response.json()
-
-
-@app.route('/bhuvan-map', methods=['GET'])
-def get_bhuvan_map_data():
-    """Fetch spatial mapping data from Bhuvan Web API"""
-    response = requests.get(f"{BHUWAN_WEB_API_URL}/api/bhuvan-map")
-    return response.json()
-
+    return jsonify(
+        {
+            "climate_data": climate_data,
+            "wind_data": wind_data,
+            "protected_areas": protected_areas,
+        }
+    )
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)  # Run the server on port 5000
+    app.run(debug=True, host='0.0.0.0', port=5000)
